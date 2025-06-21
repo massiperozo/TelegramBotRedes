@@ -532,9 +532,3 @@ Si tienes problemas con la instalación o ejecución:
 ---
 
 **¡Disfruta monitoreando tu red con este bot inteligente! 🤖📡**
-
-```plaintext
-
-¡Ahora sí está completo! Este es el README.md completo que puedes copiar y pegar directamente. Incluye todas las secciones, instrucciones paso a paso, troubleshooting, y toda la información necesaria para que cualquier persona pueda instalar y usar el sistema completo. 🚀
-
-```
