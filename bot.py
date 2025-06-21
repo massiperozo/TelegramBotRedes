@@ -3,23 +3,37 @@ import subprocess
 import re
 import platform
 import asyncio
+import json
+import time
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+import paho.mqtt.client as mqtt
 
 # --- 1. Configuración Inicial ---
 
-# ¡IMPORTANTE!: Reemplaza 'YOUR_BOT_TOKEN' con el token que te dio BotFather
+# ¡IMPORTANTE!: Reemplaza con tu token real
 TOKEN = "7733059910:AAGxkZsxiIbHUgAojSSLKN_17Zm-CZU0xpM" 
+
+# Configuración MQTT
+MQTT_BROKER = "localhost"  # Broker local
+MQTT_PORT = 1883
+MQTT_USERNAME = "network_monitor"  # Usuario que crearemos
+MQTT_PASSWORD = "monitor123"       # Contraseña que configuraremos
+MQTT_TOPIC = "mensaje_grupo"       # Tópico especificado en el proyecto
 
 # Intervalo de verificación para el monitoreo recurrente (en segundos)
 MONITOR_INTERVAL_SECONDS = 15
-# Número de solicitudes ping para el monitoreo recurrente (para una verificación rápida)
+# Número de solicitudes ping para el monitoreo recurrente
 MONITOR_PING_COUNT = 1 
 
 # Estados para la conversación
 PING_STATE = 1
 TRACEROUTE_STATE = 2
 MONITOR_STATE = 3
+
+# Cliente MQTT global
+mqtt_client = None
 
 # Configura el log
 logging.basicConfig(
@@ -28,7 +42,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- 2. Módulo de Captura de Comandos (Análisis de Salida) ---
+# --- 2. Configuración y Cliente MQTT ---
+
+def on_connect(client, userdata, flags, rc):
+    """Callback cuando se conecta al broker MQTT"""
+    if rc == 0:
+        logger.info("Conectado exitosamente al broker MQTT")
+    else:
+        logger.error(f"Error al conectar al broker MQTT. Código: {rc}")
+
+def on_publish(client, userdata, mid):
+    """Callback cuando se publica un mensaje"""
+    logger.info(f"Mensaje publicado con ID: {mid}")
+
+def on_disconnect(client, userdata, rc):
+    """Callback cuando se desconecta del broker"""
+    logger.info("Desconectado del broker MQTT")
+
+def setup_mqtt_client():
+    """Configura y conecta el cliente MQTT"""
+    global mqtt_client
+    try:
+        mqtt_client = mqtt.Client()
+        mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_publish = on_publish
+        mqtt_client.on_disconnect = on_disconnect
+        
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        logger.info("Cliente MQTT configurado y conectado")
+        return True
+    except Exception as e:
+        logger.error(f"Error al configurar cliente MQTT: {e}")
+        return False
+
+def publish_to_mqtt(data):
+    """Publica datos al broker MQTT"""
+    global mqtt_client
+    if mqtt_client is None:
+        logger.error("Cliente MQTT no está configurado")
+        return False
+    
+    try:
+        # Agregar timestamp para series de tiempo
+        data['timestamp'] = datetime.now().isoformat()
+        data['unix_timestamp'] = int(time.time())
+        
+        message = json.dumps(data)
+        result = mqtt_client.publish(MQTT_TOPIC, message, qos=1)
+        
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            logger.info(f"Datos publicados a MQTT: {data}")
+            return True
+        else:
+            logger.error(f"Error al publicar a MQTT: {result.rc}")
+            return False
+    except Exception as e:
+        logger.error(f"Error al publicar datos MQTT: {e}")
+        return False
+
+# --- 3. Módulo de Captura de Comandos (Análisis de Salida) ---
 
 def execute_ping(destination: str, count: int = 4) -> dict:
     """
@@ -115,24 +189,24 @@ def execute_traceroute(destination: str) -> dict:
         logger.error(f"Error inesperado al ejecutar traceroute: {e}")
         return {"error": f"Ocurrió un error inesperado al hacer traceroute: {e}"}
 
-# --- 3. Definición del Teclado Personalizado y Comandos ---
+# --- 4. Definición del Teclado Personalizado y Comandos ---
 
 # Opciones para el menú principal
 main_menu_keyboard = [
     [KeyboardButton("🌐 Ping Host"), KeyboardButton("📡 Traceroute Host")],
     [KeyboardButton("🟢 Iniciar Monitoreo"), KeyboardButton("🔴 Detener Monitoreo")],
-    [KeyboardButton("📚 Ayuda")]
+    [KeyboardButton("📊 Estado MQTT"), KeyboardButton("📚 Ayuda")]
 ]
 
 reply_markup = ReplyKeyboardMarkup(main_menu_keyboard, resize_keyboard=True, one_time_keyboard=False)
 
-# --- 4. Bot de Telegram (Manejo de Comandos y Respuestas) ---
+# --- 5. Bot de Telegram (Manejo de Comandos y Respuestas) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Envía un mensaje de bienvenida y muestra el teclado personalizado."""
     user = update.effective_user
     await update.message.reply_html(
-        f"👋 ¡Hola, {user.mention_html()}! Soy tu bot de monitoreo de red. \n"
+        f"👋 ¡Hola, {user.mention_html()}! Soy tu bot de monitoreo de red con MQTT. \n"
         "Selecciona una opción del teclado para empezar a diagnosticar tu red. 👇",
         reply_markup=reply_markup 
     )
@@ -169,50 +243,45 @@ async def handle_stop_monitor_button(update: Update, context: ContextTypes.DEFAU
     await stop_monitor_command(update, context)
     await update.message.reply_text("¿Qué más puedo hacer por ti? 🤔", reply_markup=reply_markup)
 
+async def handle_mqtt_status_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Maneja el botón 'Estado MQTT'."""
+    global mqtt_client
+    if mqtt_client and mqtt_client.is_connected():
+        status_message = (
+            f"📊 **Estado MQTT**\n\n"
+            f"🟢 **Conectado** al broker: `{MQTT_BROKER}:{MQTT_PORT}`\n"
+            f"📡 **Tópico**: `{MQTT_TOPIC}`\n"
+            f"👤 **Usuario**: `{MQTT_USERNAME}`\n"
+            f"⏰ **Intervalo de monitoreo**: {MONITOR_INTERVAL_SECONDS} segundos"
+        )
+    else:
+        status_message = (
+            f"📊 **Estado MQTT**\n\n"
+            f"🔴 **Desconectado** del broker MQTT\n"
+            f"🔧 Verifica que el broker esté ejecutándose en `{MQTT_BROKER}:{MQTT_PORT}`"
+        )
+    
+    await update.message.reply_text(status_message, parse_mode='Markdown', reply_markup=reply_markup)
+
 async def handle_help_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Maneja el botón 'Ayuda' y muestra instrucciones detalladas."""
     help_message = (
-        "📚 **Guía de Uso del Bot de Monitoreo de Redes**\n\n"
+        "📚 **Guía de Uso del Bot de Monitoreo de Redes con MQTT**\n\n"
         "Aquí tienes las instrucciones para usar las funciones principales: 👇\n\n"
-        "•   **🌐 Ping Host**: Si tocas este botón, o escribes `/ping`, te pediré que me envíes el **dominio o dirección IP** (ej. `google.com` o `8.8.8.8`) que deseas verificar. Luego ejecutaré un ping de 4 solicitudes y te mostraré la latencia promedio. ¡Ideal para chequear la conectividad! 🚀\n\n"
-        "•   **📡 Traceroute Host**: Si tocas este botón, o escribes `/traceroute`, te pediré el **dominio o dirección IP** (ej. `google.com` o `8.8.8.8`) para trazar la ruta. Te mostraré todos los saltos que toma la conexión. ¡Útil para ver el camino de tus datos! 🛣️\n\n"
-        "•   **🟢 Iniciar Monitoreo**: Al tocar este botón, o escribir `/start_monitor`, te pediré un **dominio o IP** para empezar a monitorearlo cada 15 segundos. Si el host deja de ser alcanzable, o vuelve a serlo, ¡te enviaré una **ALERTA**! 🚨\n\n"
-        "•   **🔴 Detener Monitoreo**: Este botón, o el comando `/stop_monitor`, detendrá cualquier monitoreo recurrente que esté en curso. 🛑\n\n"
-        "•   **📚 Ayuda**: ¡Este botón que acabas de presionar! Muestra esta guía completa. 📖\n\n"
-        "¡Recuerda que si necesitas ingresar un dominio o IP, simplemente envíamelo después de seleccionar la acción! 😉\n\n"
-        "--- --- ---\n\n"
-        "📝 **Documentación Detallada de Redes**\n\n"
-        "Para que entiendas mejor los resultados:\n\n"
-        "### 🌐 ¿Qué es Ping?\n"
-        "El comando `ping` es una herramienta de diagnóstico que mide la accesibilidad de un host en una red IP y el tiempo que tarda en enviar y recibir paquetes. Funciona enviando paquetes *ICMP Echo Request* al destino y esperando respuestas *ICMP Echo Reply*.\n\n"
-        "**¿Cómo interpretar los resultados de Ping?**\n"
-        "•   **Latencia (Tiempo de respuesta)**: Se mide en milisegundos (ms). Indica qué tan rápido responde el host. \n"
-        "    •   `Menos de 50 ms`: Muy buena latencia. Ideal para juegos y aplicaciones en tiempo real. ✨\n"
-        "    •   `50-150 ms`: Latencia aceptable. Suficiente para navegación y streaming. 👍\n"
-        "    •   `Más de 150 ms`: Latencia alta. Puede causar retrasos notables y una experiencia lenta. 🐌\n"
-        "•   **Pérdida de Paquetes**: Se expresa en porcentaje (%). Indica cuántos paquetes enviados no regresaron. \n"
-        "    •   `0% de pérdida`: Conexión perfecta. ✅\n"
-        "    •   `1-5% de pérdida`: Leve pérdida. Puede no ser notoria pero indica inestabilidad. ⚠️\n"
-        "    •   `Más de 5% de pérdida`: Pérdida significativa. Causará interrupciones, desconexiones y lentitud. 💔\n"
-        "•   **Host inalcanzable**: Si no se recibe ninguna respuesta, significa que el destino no está disponible, no responde a pings, o hay un problema de enrutamiento/firewall. 🚫\n\n"
-        "### 📡 ¿Qué es Traceroute (Tracert)?\n"
-        "El comando `traceroute` (o `tracert` en Windows) es una herramienta que muestra la ruta que toman los paquetes de datos para llegar a un destino. Lo hace enviando una serie de paquetes y midiendo el tiempo que tarda cada *salto* (router o dispositivo intermedio) en responder.\n\n"
-        "**¿Cómo interpretar los resultados de Traceroute?**\n"
-        "•   **Saltos**: Cada línea numerada representa un salto o un dispositivo (router) en la ruta. Verás la dirección IP de cada salto y el tiempo de respuesta.\n"
-        "•   **Tiempos de respuesta por salto**: Si un salto específico muestra tiempos de respuesta muy altos, puede indicar un cuello de botella o congestión en ese punto de la red. ⏳\n"
-        "•   **Asteriscos (`*`) o 'Request timed out'**: Esto significa que un salto no respondió dentro del tiempo esperado. Puede ser por:\n"
-        "    •   **Firewall**: El dispositivo está bloqueando las solicitudes de `traceroute`. 🛡️\n"
-        "    •   **Congestión**: El router está tan sobrecargado que no puede responder a tiempo. 🚦\n"
-        "    •   **Problema de enrutamiento**: El paquete no pudo seguir la ruta. ❌\n"
-        "•   **Número de saltos**: Un número excesivo de saltos puede indicar una ruta ineficiente o problemas. 📈\n\n"
-        "### 🔔 ¿Qué es el Monitoreo Recurrente?\n"
-        "Esta función permite que el bot **vigile continuamente** la accesibilidad de un host específico en segundo plano. En lugar de que tú tengas que pedir un `ping` cada vez, el bot lo hace automáticamente cada {MONITOR_INTERVAL_SECONDS} segundos.\n\n"
-        "**¿Cómo interpretar las alertas de Monitoreo?**\n"
-        "•   **🚨 ¡ALERTA! El host (...) se encuentra INALCANZABLE. 💔**: Esto significa que el host que estás monitoreando ha dejado de responder a los pings. Esto puede indicar que está caído, desconectado, o hay un problema grave en la red que impide la comunicación.\n"
-        "•   **✅ ¡Atención! El host (...) ahora es ALCANZABLE de nuevo. 🎉**: Esta es una buena noticia. El host que previamente estaba inalcanzable ahora ha vuelto a responder a los pings, indicando que el problema se ha resuelto y la conectividad ha sido restaurada."
+        "•   **🌐 Ping Host**: Ejecuta ping y publica resultados a MQTT\n"
+        "•   **📡 Traceroute Host**: Ejecuta traceroute y publica saltos a MQTT\n"
+        "•   **🟢 Iniciar Monitoreo**: Monitoreo continuo con alertas y datos MQTT\n"
+        "•   **🔴 Detener Monitoreo**: Detiene el monitoreo activo\n"
+        "•   **📊 Estado MQTT**: Muestra el estado de conexión MQTT\n"
+        "•   **📚 Ayuda**: Esta guía completa\n\n"
+        f"📡 **Configuración MQTT:**\n"
+        f"Broker: `{MQTT_BROKER}:{MQTT_PORT}`\n"
+        f"Tópico: `{MQTT_TOPIC}`\n"
+        f"Usuario: `{MQTT_USERNAME}`\n\n"
+        "Los datos se publican en formato JSON con timestamp para series de tiempo. "
+        "Usa MQTT Explorer para visualizar los datos en tiempo real. 📈"
     )
     await update.message.reply_text(help_message, parse_mode='Markdown', reply_markup=reply_markup)
-
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -225,6 +294,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.user_data.pop('state')
         await update.message.reply_text(f"🌐 Realizando ping a `{user_input}`... por favor espera. ⏳", parse_mode='Markdown')
         result = execute_ping(user_input)
+        
         if "error" in result:
             response_message = f"❌ Error al monitorear `{user_input}`: {result['error']}"
         elif result['success']:
@@ -233,17 +303,41 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"✅ Resultados de Ping para `{user_input}`:\n"
                 f"Latencia promedio: `{latency_str}`"
             )
+            
+            # Publicar a MQTT
+            mqtt_data = {
+                "type": "ping",
+                "destination": user_input,
+                "latency_ms": result['latency_ms'],
+                "success": result['success']
+            }
+            if publish_to_mqtt(mqtt_data):
+                response_message += "\n📡 Datos enviados a MQTT ✅"
+            else:
+                response_message += "\n⚠️ Error al enviar datos a MQTT"
         else:
             response_message = (
                 f"⚠️ El host `{user_input}` parece inalcanzable (pérdida de paquetes). 💔\n"
                 f"```\n{result.get('output', 'Salida no disponible')}\n```"
             )
+            
+            # Publicar fallo a MQTT
+            mqtt_data = {
+                "type": "ping",
+                "destination": user_input,
+                "latency_ms": None,
+                "success": False,
+                "error": "Host inalcanzable"
+            }
+            publish_to_mqtt(mqtt_data)
+            
         await update.message.reply_text(response_message, parse_mode='Markdown', reply_markup=reply_markup)
 
     elif current_state == TRACEROUTE_STATE:
         context.user_data.pop('state')
         await update.message.reply_text(f"📡 Realizando traceroute a `{user_input}`... esto puede tardar un poco. ⏳", parse_mode='Markdown')
         result = execute_traceroute(user_input)
+        
         if "error" in result:
             response_message = f"❌ Error al realizar traceroute a `{user_input}`: {result['error']}"
         elif result['success']:
@@ -253,6 +347,19 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                     f"✅ Saltos para `{user_input}` ({result['hop_count']} saltos): 🗺️\n"
                     f"{hops_list_str}"
                 )
+                
+                # Publicar a MQTT
+                mqtt_data = {
+                    "type": "traceroute",
+                    "destination": user_input,
+                    "hop_count": result['hop_count'],
+                    "hops": result['hops'],
+                    "success": result['success']
+                }
+                if publish_to_mqtt(mqtt_data):
+                    response_message += "\n📡 Datos enviados a MQTT ✅"
+                else:
+                    response_message += "\n⚠️ Error al enviar datos a MQTT"
             else:
                 response_message = f"⚠️ No se pudieron determinar los saltos para `{user_input}`. El destino podría ser inalcanzable. 🤔"
         else:
@@ -260,6 +367,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 f"⚠️ No se pudo completar el traceroute a `{user_input}`. 💔\n"
                 f"```\n{result.get('output', 'Salida no disponible')}\n```"
             )
+            
         await update.message.reply_text(response_message, parse_mode='Markdown', reply_markup=reply_markup)
 
     elif current_state == MONITOR_STATE:
@@ -274,7 +382,7 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         logger.info(f"Comando de texto no reconocido: {user_input}")
 
-# --- 5. Módulo de Monitoreo de Alertas (Tareas en Segundo Plano) ---
+# --- 6. Módulo de Monitoreo de Alertas (Tareas en Segundo Plano) ---
 
 async def monitor_host_periodically(chat_id: int, target: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Función que se ejecuta periódicamente para monitorear un host y enviar alertas."""
@@ -287,6 +395,16 @@ async def monitor_host_periodically(chat_id: int, target: str, context: ContextT
             ping_result = execute_ping(target, count=MONITOR_PING_COUNT) 
 
             current_state_reachable = ping_result['success']
+            
+            # Publicar datos de monitoreo a MQTT
+            mqtt_data = {
+                "type": "monitoring",
+                "destination": target,
+                "latency_ms": ping_result.get('latency_ms'),
+                "success": current_state_reachable,
+                "chat_id": chat_id
+            }
+            publish_to_mqtt(mqtt_data)
             
             if current_state_reachable and not last_state_reachable:
                 await context.bot.send_message(
@@ -342,7 +460,7 @@ async def start_monitor_command(update: Update, context: ContextTypes.DEFAULT_TY
     
     await update.message.reply_text(
         f"✅ Monitoreo recurrente iniciado para `{target_host}` cada {MONITOR_INTERVAL_SECONDS} segundos. "
-        "Recibirás alertas si cambia de estado. 🔔",
+        "Recibirás alertas si cambia de estado y los datos se enviarán a MQTT. 🔔📡",
         parse_mode='Markdown',
         reply_markup=reply_markup
     )
@@ -375,10 +493,14 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         reply_markup=reply_markup
     )
 
-# --- 6. Función Principal (Iniciar el Bot) ---
+# --- 7. Función Principal (Iniciar el Bot) ---
 
 def main() -> None:
     """Función principal para configurar e iniciar el bot de Telegram."""
+    # Configurar cliente MQTT
+    if not setup_mqtt_client():
+        logger.error("No se pudo configurar el cliente MQTT. El bot funcionará sin MQTT.")
+    
     application = Application.builder().token(TOKEN).build()
 
     # Manejadores para comandos tradicionales (si el usuario los escribe)
@@ -394,6 +516,7 @@ def main() -> None:
     application.add_handler(MessageHandler(filters.Regex("^📡 Traceroute Host$"), handle_traceroute_button))
     application.add_handler(MessageHandler(filters.Regex("^🟢 Iniciar Monitoreo$"), handle_start_monitor_button))
     application.add_handler(MessageHandler(filters.Regex("^🔴 Detener Monitoreo$"), handle_stop_monitor_button))
+    application.add_handler(MessageHandler(filters.Regex("^📊 Estado MQTT$"), handle_mqtt_status_button))
     application.add_handler(MessageHandler(filters.Regex("^📚 Ayuda$"), handle_help_button))
 
     # Importante: Este manejador debe ir al final
@@ -401,7 +524,6 @@ def main() -> None:
 
     # Manejador para comandos desconocidos (si escriben /algo_raro)
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
-
 
     logger.info("Bot iniciado y escuchando mensajes de Telegram...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
